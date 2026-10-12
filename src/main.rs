@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::json::ArrayWriter;
 use serde_json::json;
 mod store;
@@ -35,6 +36,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/logs", post(log).get(search))
+        .route("/api/v1/stats", get(stats))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -48,6 +50,7 @@ async fn health() -> impl IntoResponse {
     StatusCode::OK
 }
 
+const DEFAULT_BUCKET_MS: i64 = 60_000;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const MAX_BATCH: usize = 10_000;
@@ -123,7 +126,7 @@ async fn search(
         limit,
     };
 
-    match encode(&state.logs, &filter).await {
+    match state.logs.query(&filter).await.map_err(Into::into).and_then(encode) {
         Ok(logs) => (StatusCode::OK, Json(json!({ "count": logs.len(), "logs": logs }))),
         Err(err) => {
             tracing::error!("failed to query logs: {err}");
@@ -135,11 +138,9 @@ async fn search(
     }
 }
 
-async fn encode(
-    store: &LogStore,
-    filter: &LogFilter,
+fn encode(
+    batches: Vec<RecordBatch>,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let batches = store.query(filter).await?;
     let mut writer = ArrayWriter::new(Vec::new());
     for batch in &batches {
         writer.write(batch)?;
@@ -150,6 +151,50 @@ async fn encode(
         return Ok(Vec::new());
     }
     Ok(serde_json::from_slice(&buf)?)
+}
+
+#[derive(Deserialize)]
+struct StatsParams {
+    service: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
+    bucket: Option<i64>,
+}
+
+async fn stats(
+    State(state): State<AppState>,
+    Query(params): Query<StatsParams>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let bucket_ms = params.bucket.unwrap_or(DEFAULT_BUCKET_MS);
+    if bucket_ms <= 0 {
+        return error_response(vec!["bucket must be positive milliseconds".to_string()]);
+    }
+    if let (Some(from), Some(to)) = (params.from, params.to) {
+        if from >= to {
+            return error_response(vec!["from must be less than to".to_string()]);
+        }
+    }
+
+    let result = state
+        .logs
+        .stats(params.service.as_deref(), params.from, params.to, bucket_ms)
+        .await
+        .map_err(Into::into)
+        .and_then(encode);
+
+    match result {
+        Ok(buckets) => (
+            StatusCode::OK,
+            Json(json!({ "bucket_ms": bucket_ms, "buckets": buckets })),
+        ),
+        Err(err) => {
+            tracing::error!("failed to compute stats: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "errors": ["failed to compute stats"] })),
+            )
+        }
+    }
 }
 
 fn error_response(errors: Vec<String>) -> (StatusCode, Json<serde_json::Value>) {

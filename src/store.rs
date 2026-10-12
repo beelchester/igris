@@ -4,6 +4,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::MemTable;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
+use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::functions::expr_fn::contains;
 use datafusion::prelude::{col, lit};
 use std::sync::Arc;
@@ -69,6 +70,33 @@ impl LogStore {
         }
         df.sort(vec![col("timestamp").sort(false, false)])?
             .limit(0, Some(filter.limit))?
+            .collect()
+            .await
+    }
+
+    pub async fn stats(
+        &self,
+        service: Option<&str>,
+        from: Option<i64>,
+        to: Option<i64>,
+        bucket_ms: i64,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut df = self.ctx.table(TABLE).await?;
+        if let Some(service) = service {
+            df = df.filter(col("service").eq(lit(service)))?;
+        }
+        if let Some(from) = from {
+            df = df.filter(col("timestamp").gt_eq(lit(from)))?;
+        }
+        if let Some(to) = to {
+            df = df.filter(col("timestamp").lt(lit(to)))?;
+        }
+        let bucket = (col("timestamp") / lit(bucket_ms) * lit(bucket_ms)).alias("bucket");
+        df.aggregate(vec![bucket, col("level")], vec![count(lit(1)).alias("count")])?
+            .sort(vec![
+                col("bucket").sort(true, false),
+                col("level").sort(true, false),
+            ])?
             .collect()
             .await
     }
