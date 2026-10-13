@@ -29,9 +29,16 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let state = AppState {
-        logs: LogStore::new().unwrap(),
-    };
+    let data_dir = std::env::var("IGRIS_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let retention_hours: u64 = std::env::var("IGRIS_RETENTION_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RETENTION_HOURS);
+    let retention_ms = (retention_hours > 0).then(|| retention_hours as i64 * 3_600_000);
+
+    let logs = LogStore::open(data_dir.into(), retention_ms).await.unwrap();
+    logs.spawn_retention();
+    let state = AppState { logs };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -50,6 +57,7 @@ async fn health() -> impl IntoResponse {
     StatusCode::OK
 }
 
+const DEFAULT_RETENTION_HOURS: u64 = 168;
 const DEFAULT_BUCKET_MS: i64 = 60_000;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
